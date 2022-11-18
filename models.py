@@ -1,25 +1,38 @@
-import pandas as pd # a library with data structures for manipulating numerical tables
-import numpy as np # a python library for working w/ numerical arrays
-import torch # a python deep learning framework
+import pandas as pd
+import numpy as np
 import math
 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.autograd import Variable
+from torch.distributions import NegativeBinomial, Normal, Distribution, Gamma, Poisson, constraints
+from torch.distributions import kl_divergence as kl
+from torch.distributions.utils import (
+    broadcast_all,
+    lazy_property,
+    logits_to_probs,
+    probs_to_logits,
+)
+
+import warnings
+from typing import Optional, Tuple, Union
 
 from scipy.linalg import block_diag
 from collections import namedtuple
 Outputs = namedtuple('Outputs', 'z global_recon module_outputs mu logvar')
+OutputsNB = namedtuple('Outputs', 'z global_recon mu logvar output_mean')
 VAEOutputs = namedtuple('VAEOutputs', 'z global_recon mu logvar')
 
+#utility function for kernel-based losses
 def gram_matrix(x, sigma=1):
     pairwise_distances = x.unsqueeze(1) - x
     return torch.exp(-pairwise_distances.norm(2, dim=2) / (2 * sigma * sigma))
 
 class vaeEncoder(nn.Sequential):
     ##
-    ## Encoder Module for pmVAE
+    ## Encoder Module for a standard VAE
     ##
     def __init__(self,
         n_features,
@@ -53,7 +66,7 @@ class vaeEncoder(nn.Sequential):
                 
 class vaeDecoder(nn.Sequential):
     ##
-    ## Encoder Module for pmVAE
+    ## Decoder Module for standard VAE
     ##
     def __init__(self,
         n_features,
@@ -81,7 +94,7 @@ class vaeDecoder(nn.Sequential):
 
 class linearDecoder(nn.Sequential):
     ##
-    ## Encoder Module for pmVAE
+    ## Linear decoder module for a VAE
     ##
     def __init__(self,
         n_features,
@@ -98,12 +111,8 @@ class linearDecoder(nn.Sequential):
 
 class VAE(nn.Module):
     ##
-    ## classes have methods like __init__
-    ## which initializes your object. Since all 
-    ## CVAEs will have a certain input dimension, a certain
-    ## hidden layer dimension, a certain latent space dimennsion, etc.
-    ## you need to tell the class CVAE which values your particular
-    ## CVAE will take
+    ## Combined VAE Module
+    ## forward method returns z, global_recon, mu, logvar
     ##
     def __init__(self, n_features, hidden_layers,
                  activation='elu',
@@ -172,7 +181,7 @@ class VAE(nn.Module):
         return outputs
 
 class VAEModel(object):
-    'A cvae model for rna-seq conditional on lineage'
+    'VAE Model class with training methods'
     def __init__(self, 
                  n_features, 
                  hidden_layers,
@@ -183,7 +192,7 @@ class VAEModel(object):
                  decoder='neural',
                  **kwargs):
         '''
-        Create a cvae for rna-seq.
+        initialize model.
         '''
         self.model = VAE(n_features, hidden_layers,
                  activation='elu',
@@ -221,7 +230,6 @@ class VAEModel(object):
         self.weight_decay = weight_decay
         
         # Create torch DataLoaders from the training and validation datasets.
-        # Necessary for batching and shuffling data.
         train_dataloader = torch.utils.data.DataLoader(
                 train_dataset,
                 batch_size=batch_size,
@@ -282,7 +290,6 @@ class VAEModel(object):
                     
             self.optimizer.zero_grad()
 
-#             recon_batch, mu, log_var = self.model(x)
             outputs = self.model(x)
             loss = self.loss_function(outputs.global_recon, x, outputs.mu, outputs.logvar)
 
@@ -307,7 +314,6 @@ class VAEModel(object):
                 else:
                     x = data.float()
 
-#             recon_batch, mu, log_var = self.model(x)
             outputs = self.model(x)
             loss = self.loss_function(outputs.global_recon, x, outputs.mu, outputs.logvar, val=True)
 
@@ -420,7 +426,7 @@ class CustomizedLinearFunction(torch.autograd.Function):
 class CustomizedLinear(nn.Module):
     def __init__(self, mask, bias=True):
         """
-        extended torch.nn module which mask connection.
+        extended torch.nn module which masks connections.
         Arguments
         ------------------
         mask [torch.tensor]:
@@ -805,7 +811,6 @@ class pmVAEModel(object):
     def compute_hsic(self, x, y, sigma=1):
         m = x.shape[0]
         K = gram_matrix(x, sigma=sigma)
-#         y = y.float().reshape(-1, 1)
         L = gram_matrix(y, sigma=sigma)
         H = torch.eye(m) - 1.0 / m * torch.ones((m, m))
         if self.use_gpu:
@@ -852,8 +857,6 @@ class pmVAEModel(object):
 
                     # only compute the loss with participating genes
                     wmse = self.weighted_mse(x, local_recon, feat_mask)
-    #                 print("WMSE")
-    #                 print(wmse.shape)
 
                     local_recon_loss = local_recon_loss + wmse
 
@@ -892,7 +895,6 @@ class pmVAEModel(object):
               max_epochs=1200,
               lr=0.001,
               beta=1e-5,
-#               weight_decay=1e-4,
               batch_size=256,
               pathway_dropout=True,
               logpath=None,
@@ -901,7 +903,6 @@ class pmVAEModel(object):
         self.checkpoint_path = checkpoint_path
         self.lr = lr
         self.beta = beta
-#         self.weight_decay = weight_decay
         
         # Create torch DataLoaders from the training and validation datasets.
         # Necessary for batching and shuffling data.
@@ -958,6 +959,430 @@ class pmVAEModel(object):
         for batch_idx, data in enumerate(train_dataloader):
             self.optimizer.zero_grad()
             loss = self.calc_loss(data, pathway_dropout=pathway_dropout, use_c=use_c)
+            loss.backward()
+            train_loss += loss.item()
+            self.optimizer.step()
+        return train_loss
+    
+    def _val_epoch(self,val_dataloader,use_c=False):
+        self.model.train(False)
+        val_loss = 0
+        for batch_idx, data in enumerate(val_dataloader):
+            loss = self.calc_loss(data, val=True, use_c=use_c)
+            val_loss += loss.item()
+        return val_loss
+    
+    def _checkpoint(self, epoch, valloss, suffix=None):
+        '''
+        Save a checkpoint to self.checkpoint_path, including the full model, 
+        current epoch, learning rate, and random number generator state.
+        '''
+        state = {'model': self.model,
+                 'best_loss': valloss,
+                 'epoch': epoch,
+                 'rng_state': torch.get_rng_state(),
+                 'LR': self.lr ,
+                 'optimizer': self.optimizer.state_dict()}
+        checkpoint_path = self.checkpoint_path
+        if suffix is not None:
+            checkpoint_path = checkpoint_path + suffix
+        torch.save(state, checkpoint_path)
+    def load_checkpoint(self, path, load_optimizer=False):
+        checkpoint = torch.load(path)
+        self.model = checkpoint['model']
+        if load_optimizer:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+            
+    def latent_space_names(self, terms=None):
+        terms = self.model.terms if terms is None else terms
+        assert terms is not None, 'Need to specify gene set terms'
+
+        if self.model.add_auxiliary_module \
+                and len(terms) == self.model.num_annotated_modules:
+            terms = list(terms) + ['AUXILIARY']
+
+        z = self.model._module_latent_dim
+        repeated_terms = np.repeat(terms, z)
+        index = np.tile(range(z), len(terms)).astype(str)
+        latent_dim_names = map('-'.join, zip(repeated_terms, index))
+
+        return list(latent_dim_names)
+    
+    def set_gpu(self, use_gpu):
+        assert type(use_gpu) is bool, 'Argument must be "True" or "False"'
+        if use_gpu:
+            self.model.cuda()
+            self.model.use_gpu = use_gpu
+            self.use_gpu = use_gpu
+            
+        else:
+            self.model.cpu()
+            self.model.use_gpu = use_gpu
+            self.use_gpu = use_gpu
+            
+######
+###### pmVAE with Neg binomial dist
+######
+
+class pmVAEnb(nn.Module):
+    ##
+    ## Full pmVAE model that fits a neg binomial dist in the last layer
+    ## Negative binomial generative model adapted from
+    ## tutorial here: https://docs.scvi-tools.org/en/stable/tutorials/notebooks/module_user_guide.html
+    ##
+    def __init__(self, 
+        membership_mask,
+        hidden_layers,
+        latent_dim,
+        activation='elu',
+        batch_norm=True,
+        decoder='neural',
+        bias_last_layer=False,
+        add_auxiliary_module=False,
+        cdim=None,
+        terms=None,
+        use_gpu=True,
+        **kwargs):
+        super(pmVAEnb, self).__init__()
+        
+        self.decoder=decoder
+        
+        self.use_gpu = use_gpu
+        
+        self.num_annotated_modules, self.num_feats = membership_mask.shape
+        if isinstance(membership_mask, pd.DataFrame):
+            terms = membership_mask.index
+            membership_mask = membership_mask.values
+        
+        self.add_auxiliary_module = add_auxiliary_module
+        if add_auxiliary_module:
+            membership_mask = np.vstack(
+                    (membership_mask, np.ones_like(membership_mask[0])))
+            if terms is not None:
+                terms = list(terms) + ['AUXILIARY']
+                
+        self.cdim = cdim
+                
+        self.membership_mask=membership_mask
+        self.module_isolation_mask = build_module_isolation_mask(
+                self.membership_mask.shape[0],
+                hidden_layers[-1])
+        
+        self._module_latent_dim = latent_dim
+        self._hidden_layers = hidden_layers
+        assert len(terms) == len(self.membership_mask)
+        self.terms = list(terms)
+        
+        self.encoding_masks = build_mask_list(membership_mask, hidden_layers, latent_dim)
+#         # transpose masks for decoding
+        self.decoding_masks = [mask.T for mask in self.encoding_masks[::-1]]
+        if cdim is not None:
+            self.encoding_masks[0] = np.vstack(
+                    (self.encoding_masks[0], np.ones((cdim,self.encoding_masks[0].shape[1]))))
+            self.decoding_masks[0] = np.vstack(
+                    (self.decoding_masks[0], np.ones((cdim,self.decoding_masks[0].shape[1]))))
+        
+        self.encoder_net = pmEncoder(membership_mask,
+                        hidden_layers,
+                        latent_dim,
+                        activation='elu',
+                        batch_norm=True,
+                        cdim=cdim,
+                        **kwargs)
+        if decoder == 'neural':
+            self.decoder_net = pmDecoder(membership_mask,
+                            hidden_layers,
+                            latent_dim,
+                            activation='elu',
+                            batch_norm=True,
+                            cdim=cdim,
+                            **kwargs)
+        elif decoder == 'linear':
+            self.decoder_net = linearDecoder(membership_mask.shape[1],
+                            hidden_layers,
+                            activation='elu',
+                            batch_norm=True,
+                            cdim=cdim,
+                            **kwargs)
+
+        self.merge_layer = CustomizedLinear(self.decoding_masks[-1],bias=bias_last_layer)
+        
+        self.log_theta = torch.nn.Parameter(torch.randn(membership_mask.shape[1]))
+        
+    def encode(self, x, **kwargs):
+        params = self.encoder_net(x, **kwargs)
+        mu, logvar = torch.split(params, int(params.size(1)/2), dim=1)
+        return mu, logvar
+
+    def decode(self, z, **kwargs):
+        module_outputs = self.decoder_net(z, **kwargs)
+        global_recon = self.merge(module_outputs, **kwargs)
+        return global_recon
+
+    def merge(self, module_outputs, **kwargs):
+        global_recon = self.merge_layer(module_outputs, **kwargs)
+        return global_recon
+    
+    def generative(self, z, library):
+        """Runs the generative model."""
+
+        # get the "normalized" mean of the negative binomial
+        px_scale = torch.nn.Softmax(dim=-1)(self.decode(z))
+        # get the mean of the negative binomial
+        px_rate = library * px_scale
+        # get the dispersion parameter
+        theta = torch.exp(self.log_theta)
+
+        return dict(
+            px_scale=px_scale, theta=theta, px_rate=px_rate
+        )
+    
+    def reparametrize(self, mu, logvar):
+        if self.use_gpu:
+            eps = torch.randn(logvar.shape).cuda()
+        else:
+            eps = torch.randn(logvar.shape)
+        return mu + torch.exp(logvar / 2) * eps
+    
+    def get_masks_for_local_losses(self):
+        if self.add_auxiliary_module:
+            return zip(self.membership_mask[:-1],
+                       self.module_isolation_mask[:-1])
+
+        return zip(self.membership_mask,
+                   self.module_isolation_mask)
+    
+    def calc_likelihood_latent_z(self, x, z, c=None, **kwargs):
+        library = torch.sum(x, dim=1, keepdim=True)
+   
+        x_ = torch.log(1.0 + x)
+                
+        if c is not None:
+            network_input = torch.cat([x_, c], 1)
+        else:
+            network_input = x_
+        mu, logvar = self.encode(network_input, **kwargs)
+        generative_params = self.generative(z, library)
+        px_rate = generative_params["px_rate"]
+        theta = generative_params["theta"]
+        qz_m = mu
+        qz_v = torch.exp(logvar / 2)
+        nb_logits = (px_rate + 1e-4).log() - (theta + 1e-4).log()
+        log_lik = NegativeBinomial(theta, logits=nb_logits).log_prob(x).sum(dim=-1)
+        return -log_lik.view(-1,1)
+        
+    def forward(self, x, c=None, **kwargs):
+        
+        # log the input to the variational distribution for numerical stability
+        x_ = torch.log(1.0 + x)
+                
+        if c is not None:
+            network_input = torch.cat([x_, c], 1)
+        else:
+            network_input = x_
+            
+        mu, logvar = self.encode(network_input, **kwargs)
+        z = self.reparametrize(mu, logvar)
+        
+        if c is not None:
+            latent_input = torch.cat([z, c], 1)
+        else:
+            latent_input = z
+        
+        module_outputs = self.decoder_net(latent_input, **kwargs)
+        px_scale = self.merge(module_outputs, **kwargs)
+        
+        library = torch.sum(x, dim=1, keepdim=True)
+        
+        generative_params = self.generative(z, library)
+        px_rate = generative_params["px_rate"]
+        theta = generative_params["theta"]
+        qz_m = mu
+        qz_v = logvar
+        
+        # term 1
+        # the pytorch NB distribution uses a different parameterization
+        # so we must apply a quick transformation (included in scvi-tools, but here we use the pytorch code)
+        nb_logits = (px_rate + 1e-4).log() - (theta + 1e-4).log()
+        global_recon = NegativeBinomial(theta, logits=nb_logits).sample()
+        output_mean = NegativeBinomial(theta, logits=nb_logits).mean
+        
+        outputs = OutputsNB(z, global_recon, mu, logvar, output_mean)
+            
+        return outputs
+
+class pmVAEModelNB(object):
+    'A full model training wrapper for the pmVAE model'
+    def __init__(self, 
+        membership_mask,
+        hidden_layers,
+        latent_dim,
+        cdim = None,
+        hsic_penalty=None,
+        activation='elu',
+        batch_norm=True,
+        bias_last_layer=False,
+        add_auxiliary_module=False,
+        use_gpu=True,
+        **kwargs):
+        '''
+        Create a pmVAE for rna-seq.
+        '''
+        super(pmVAEModelNB, self).__init__()
+        
+        self.cdim = cdim
+        self.hsic_penalty = hsic_penalty
+        
+        self.model = pmVAEnb( 
+        membership_mask,
+        hidden_layers,
+        latent_dim,
+        cdim=cdim,
+        activation=activation,
+        batch_norm=batch_norm,
+        bias_last_layer=bias_last_layer,
+        add_auxiliary_module=add_auxiliary_module,
+        use_gpu=use_gpu,
+        **kwargs)
+        
+        self.use_gpu=use_gpu
+        
+        if self.use_gpu:
+            self.model.cuda()
+        
+    def calc_loss(self, data, val=False, use_c=False):
+        
+        if use_c:
+            if self.use_gpu:
+                x, c = data[0].float().cuda(), data[1].float().cuda()
+            else:
+                x, c = data[0].float(), data[1].long()
+              
+            x_ = torch.log(1.0 + x)
+            network_input = torch.cat([x_, c], 1)
+            
+        else:
+            if self.use_gpu:
+                x = data.float().cuda()
+            else:
+                x = data.float()
+            x_ = torch.log(1.0 + x)
+            network_input = x_
+            
+        library = torch.sum(x, dim=1, keepdim=True)
+        
+        mu, logvar = self.model.encode(network_input)
+        z = self.model.reparametrize(mu, logvar)
+        generative_params = self.model.generative(z, library)
+        px_rate = generative_params["px_rate"]
+        theta = generative_params["theta"]
+        qz_m = mu
+        qz_v = torch.exp(logvar / 2)
+        
+        # term 1
+        # the pytorch NB distribution uses a different parameterization
+        # so we must apply a quick transformation (included in scvi-tools, but here we use the pytorch code)
+        nb_logits = (px_rate + 1e-4).log() - (theta + 1e-4).log()
+        log_lik = NegativeBinomial(theta, logits=nb_logits).log_prob(x).sum(dim=-1)
+        
+        if val:
+            return -log_lik.mean()
+        else:
+            # term 2
+            prior_dist = Normal(torch.zeros_like(qz_m), torch.ones_like(qz_v))
+            var_post_dist = Normal(qz_m, torch.sqrt(qz_v))
+            kl_divergence = kl(var_post_dist, prior_dist).sum(dim=1)
+            elbo = log_lik - self.beta * kl_divergence
+            loss = torch.mean(-elbo)
+            return loss
+        
+    def get_recon_error(self, 
+                        val_dataset,
+                        batch_size=256):
+        val_dataloader = torch.utils.data.DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=2)
+        
+        valloss = self._val_epoch(val_dataloader)
+        valloss /= len(val_dataset)
+        
+        return valloss
+        
+        
+    def train(self, 
+              train_dataset, 
+              val_dataset, 
+              max_epochs=1200,
+              lr=0.001,
+              beta=1e-5,
+#               weight_decay=1e-4,
+              batch_size=256,
+              pathway_dropout=True,
+              logpath=None,
+              checkpoint_path='pmvae_checkpoint.pkl',
+              verbose=True):
+        self.checkpoint_path = checkpoint_path
+        self.lr = lr
+        self.beta = beta
+#         self.weight_decay = weight_decay
+        
+        # Create torch DataLoaders from the training and validation datasets.
+        # Necessary for batching and shuffling data.
+        train_dataloader = torch.utils.data.DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=2)
+        val_dataloader = torch.utils.data.DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=2)
+        
+        self.x_dim = train_dataset.X.shape[1]
+        
+        self.optimizer = optim.Adam(self.model.parameters(),lr=self.lr)
+        
+        best_loss = None
+        for i_epoch in range(max_epochs):
+            print("-------- Epoch {:03d} --------".format(i_epoch))
+            
+            if self.cdim is not None:
+                use_c=True
+            else:
+                use_c=False
+                
+            trainloss = self._train_epoch(train_dataloader, use_c=use_c)
+            trainloss /= len(train_dataset)
+            valloss = self._val_epoch(val_dataloader, use_c=use_c)
+            valloss /= len(val_dataset)
+            
+            # only save if improvement
+            if best_loss is None or valloss < best_loss: 
+                best_loss = valloss
+                self._checkpoint(i_epoch, valloss, suffix='.best_loss')
+            else:
+                self.lr = self.lr/10.
+                self.optimizer = optim.Adam(self.model.parameters(),lr=self.lr)
+            # Write information on this epoch to a log.
+            logstr = "Epoch {:03d}: ".format(i_epoch) +\
+                     "training loss {:08.4f},".format(trainloss) +\
+                     "validation loss {:08.4f}".format(valloss)
+            if not logpath is None:
+                with open(logpath, 'a') as logfile:
+                    logfile.write(logstr + '\n')
+            if verbose:
+                print(logstr)
+        self.load_checkpoint(self.checkpoint_path+'.best_loss')
+        
+    def _train_epoch(self,train_dataloader,pathway_dropout=True,use_c=False):
+        self.model.train()
+        train_loss = 0
+        for batch_idx, data in enumerate(train_dataloader):
+            self.optimizer.zero_grad()
+            loss = self.calc_loss(data, use_c=use_c)
             loss.backward()
             train_loss += loss.item()
             self.optimizer.step()
