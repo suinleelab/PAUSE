@@ -1,3 +1,5 @@
+# impute benchmark on standard VAE
+
 import anndata
 import numpy as np
 import pandas as pd
@@ -17,12 +19,12 @@ import argparse
 from pathexplainer import PathExplainerTorch
 from sklearn.linear_model import LogisticRegression
 
-from models import pmVAEModel
+from models import VAEModel
 import time 
 
 import os
 
-save_path = 'new_for_revision/new_res/'
+save_path = 'new_for_revision/new_res/dense/'
 
 def main():
     
@@ -36,34 +38,29 @@ def main():
     
     os.environ["CUDA_VISIBLE_DEVICES"]=args.which_gpu
 
+    
     # load datlinger data 
     if args.dataset == 'datlinger':
         
         data = anndata.read('data/datlinger_pp.h5ad')
         symbols = data.var_names
-        
-    # load norman data  
-    if args.dataset == 'norman':
-        data = anndata.read('/projects/leelab/data/single-cell/norman_2019/preprocessed/adata_top_2000_genes_tc.h5ad')
-        data = data[(data.obs['gene_program'] == 'Ctrl') | (data.obs['gene_program'] == 'Granulocyte/apoptosis')].copy()
     
-        test_df = pd.DataFrame(index=data.var['gene_name'])
-        symbols = test_df.index
     
      # load kang data
     if args.dataset == 'kang':
         
         data = anndata.read('data/kang_count.h5ad')
         symbols = data.var_names
-        
+                
     
     # load mcfarland data
     if args.dataset == 'mcfarland':
-
+        
         data = anndata.read('/projects/leelab/data/single-cell/mcfarland_2020_Idasanutlin/preprocessed/adata_top_2000_genes_tc.h5ad')
         data = data[data.obs['condition'] == 'Idasanutlin'].copy() 
         symbols = data.var_names
- 
+            
+
     # load zheng data 
     if args.dataset == 'zheng':
         data = anndata.read('/projects/leelab/data/single-cell/zheng_2017/preprocessed/adata_top_2000_genes.h5ad')
@@ -88,7 +85,8 @@ def main():
         symbols = pd.Index(set(symbols.to_numpy()))
 
         # filter out post transplant
-        data = data[data.obs['condition'] != 'post_transplant'][:,is_in].copy()  
+        data = data[data.obs['condition'] != 'post_transplant'][:,is_in].copy() 
+        
             
     # load haber data
     if args.dataset == 'haber':
@@ -99,7 +97,8 @@ def main():
         data = data[data.obs['condition'] != 'Salmonella'].copy()
        
         symbols = data.var_names
-
+    
+        
 
     # load grubman data 
     if args.dataset == 'grubman':
@@ -107,22 +106,18 @@ def main():
         data = anndata.read('/projects/leelab/data/single-cell/grubman_2019/preprocessed/adata_top_2000_genes.h5ad')
        
         symbols = data.var_names
-         
-        
-    # for all datasets 
+    
+      # for all datasets 
     data.varm['I'] = load_annotations(
         'data/c2.cp.reactome.v7.4.symbols.gmt',
         symbols,
-        min_genes=13
+        min_genes=33
     ).values
     data.uns['terms'] = list(load_annotations(
         'data/c2.cp.reactome.v7.4.symbols.gmt',
         symbols,
-        min_genes=13
+        min_genes=33
     ).columns)
-    
-    top_ig = pd.DataFrame(index=data.uns['terms'])
-    top_lr = pd.DataFrame(index=data.uns['terms'])
     
     number_of_pathways = 20
     number_of_replicates = 10
@@ -159,27 +154,30 @@ def main():
         val_ds = RNASeqData(np.array(val_data.X))
         
         # load annotations
+       
+    
         membership_mask = load_annotations('data/c2.cp.reactome.v7.4.symbols.gmt',
                                             symbols,
                                             min_genes=13
-                                        ).astype(bool).T
         
         ##
         ## train base model
         ##
         
+
         # initialize base model
-        basePMVAE = pmVAEModel(membership_mask.values,
-                                [12],
-                                1,
+        basePMVAE = VAEModel(n_features=tr_data.X.shape[1],
+                                hidden_layers=[12*n_pathways, n_pathways],
                                 beta=1e-05,
-                                terms=membership_mask.index,
                                 add_auxiliary_module=False
                             )
         
+        
+        print(basePMVAE.model)
+        
         # train
         basePMVAE.train(tr_ds, val_ds, 
-                        checkpoint_path=args.dataset + '_' + args.removal +'_baseModel.pkl',
+                        checkpoint_path='saved_models/dense/'+args.dataset + '_' + args.removal +'_baseModel.pkl',
                         max_epochs=100)
         
         basePMVAE.set_gpu(False)
@@ -203,14 +201,16 @@ def main():
         end_logvar= time.time()
         logvar_times.append(end_logvar-start_logvar)
 
-        
         # IG pathway rankings
         print("Calc IG score")
         start_ig = time.time()
         
         def model_loss_wrapper(z):
             module_outputs = basePMVAE.model.decoder_net(z)
-            global_recon = basePMVAE.model.merge(module_outputs)
+            
+            global_recon = module_outputs
+            #global_recon = basePMVAE.model.merge(module_outputs)
+            
             return F.mse_loss(global_recon, ground_truth, reduction='none').mean(1).view(-1,1)
         
         input_data = outs.z
@@ -220,30 +220,44 @@ def main():
         explainer = PathExplainerTorch(model_loss_wrapper)
         attributions = explainer.attributions(input_data,
                                               baseline=baseline_data,
-                                              num_samples=200,
+                                              num_samples=200, #200
                                               use_expectation=False)
         
         np_attribs = attributions.detach().numpy()
         top_features['IG'] = np_attribs.mean(0)
-        
-        top_ig[rand_seed] = np_attribs.mean(0)
-        
+                
         end_ig = time.time()
         ig_times.append(end_ig - start_ig)
-        
         
         
         # LR pathway rankings
         print("Calc LR score")
         start_lr = time.time()
                             
-        if args.dataset == 'kang' or args.dataset == 'datlinger':
+        if args.dataset == 'kang':
+            print('here')
+            y_tr = tr_data.obs['condition']
+            y_val = val_data.obs['condition']
+                            
+            train_labels = (y_tr == b'stimulated').values
+            val_labels = (y_val == b'stimulated').values
+            
+            print(train_labels.shape)
+            print(train_labels.sum())
+            
+            print(val_labels.shape)
+            print(val_labels.sum())
+            
+            print(tr_data.obs['condition'])
+            
+            
+        if args.dataset == 'datlinger':
             y_tr = tr_data.obs['condition']
             y_val = val_data.obs['condition']
                             
             train_labels = (y_tr == 'stimulated').values
             val_labels = (y_val == 'stimulated').values
-                            
+       
                             
         if args.dataset == 'mcfarland':
             
@@ -275,16 +289,7 @@ def main():
                             
             train_labels = (y_tr == 'healthy').values
             val_labels = (y_val == 'healthy').values
-            
-            
-        if args.dataset == 'norman': 
-            y_tr = tr_data.obs['gene_program']
-            y_val = val_data.obs['gene_program']
-                            
-            train_labels = (y_tr == 'Ctrl').values
-            val_labels = (y_val == 'Ctrl').values
         
-    
         train_embedding = basePMVAE.model(torch.tensor(tr_data.X).float()).z.detach().numpy()
         val_embedding = basePMVAE.model(torch.tensor(val_data.X).float()).z.detach().numpy()
         
@@ -314,6 +319,7 @@ def main():
         print("Calc Random")
         np.random.seed(rand_seed)
         top_features['rand'] = np.random.randn(top_features.shape[0])
+        
              
         times = pd.DataFrame()
         times['logvar_times'] = logvar_times
@@ -322,8 +328,9 @@ def main():
         times['kld_times'] = kld_times
 
         times.to_csv(save_path + args.dataset + '_times.csv')
+
         
-        # impute or retrain
+        # impute 
         def impute_benchmark(method,n_pathways=20):
             method_recons_errors = []
 
@@ -338,42 +345,14 @@ def main():
                     test_matrix_embedded[:,index_to_zero] = 0.
 
                 module_outputs = basePMVAE.model.decoder_net(test_matrix_embedded)
-                global_recon = basePMVAE.model.merge(module_outputs)
+                
+                global_recon = module_outputs
+                                           
                 recons_error = F.mse_loss(global_recon, test_matrix).detach().item()
                 method_recons_errors.append(recons_error)
             return method_recons_errors
-        
-        def retrain_benchmark(method,n_pathways=20):
-            method_recons_errors = []
-            # for top 20 pathways 
-            for i in range(1,21):
 
-                # get cumulative pathways
-                A_new=[]
-                for x in top_features.sort_values(method).index[:i]:
-                    A_new.append(membership_mask.loc[x,:].values.reshape(1,-1))
-                A_new = np.concatenate(A_new,axis=0)
-
-                reducedVAE = pmVAEModel(
-                                A_new,
-                                [12],
-                                1,
-                                beta=1e-05,
-                                terms=list(range(A_new.shape[0])),
-                                add_auxiliary_module=False
-                            )
-                
-                reducedVAE.train(tr_ds, val_ds, checkpoint_path= args.dataset + '_' + args.removal +'_reducedVAE.pkl', max_epochs=50)
-
-                test_matrix = torch.tensor(test_data.X).float().cuda()
-                global_recon = reducedVAE.model(test_matrix).global_recon
-
-                recons_error = F.mse_loss(global_recon, test_matrix).detach().item()
-                method_recons_errors.append(recons_error)
-            return method_recons_errors    
-        
-
-        # run impute or retrain 
+        # run impute 
         if args.removal == "impute": 
             print("Impute Logvar")
             logvar_results[rand_seed,:] = impute_benchmark('logvar')
@@ -386,18 +365,6 @@ def main():
             print("Impute RAND")
             rand_results[rand_seed,:] = impute_benchmark('rand')
             
-        if args.removal == "retrain":
-            print("Retrain Logvar")
-            logvar_results[rand_seed,:] = retrain_benchmark('logvar')
-            print("Retrain IG")
-            ig_results[rand_seed,:] = retrain_benchmark('IG')
-            print("Retrain LR")
-            lr_results[rand_seed,:] = retrain_benchmark('lr_score')
-            print("Retrain KLD")
-            kld_results[rand_seed,:] = retrain_benchmark('kld')
-            print("Retrain RAND")
-            rand_results[rand_seed,:] = retrain_benchmark('rand')
-                      
                     
         # save results every iteration so that if it crashes
         # there's at least some progress
@@ -411,7 +378,6 @@ def main():
             np.save(f, kld_results)
         with open('{}/{}_{}_rand.npy'.format(save_path, args.dataset, args.removal), 'wb') as f:
             np.save(f, rand_results)
-    
     
 if __name__ == '__main__':
     main()    
