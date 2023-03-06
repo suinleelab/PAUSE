@@ -41,8 +41,7 @@ from models import pmVAEModel
 # 3) an integer indicating the number of nodes in each module's bottleneck.
 pmvae = pmVAEModel(
     membership_mask,
-    [6], # This indicates that there will be one intermediate layer before the bottleneck with 6 nodes in each module. 
-         # To have 2 intermediate layers of 6 nodes, you could write [6, 6]
+    [6], # This indicates that there will be one intermediate layer before the bottleneck with 6 nodes in each module. To have 2 intermediate layers of 6 nodes, you could write [6, 6]
     4, # number of nodes in each module bottleneck 
     terms=membership_mask.index, # a list of the names of the pathway modules
     add_auxiliary_module=True # whether or not to include a densely connected auxiliary module
