@@ -17,7 +17,7 @@ import anndata
 # and other import statements...
 
 ## load a single cell dataset
-data = anndata.read('data/datlinger_pp.h5ad')
+data = anndata.read('data/kang_count.h5ad')
 
 ## load a pathway gene set file 
 ## more examples can be found here (http://www.gsea-msigdb.org/gsea/msigdb/collections.jsp)
@@ -41,7 +41,7 @@ from models import pmVAEModel
 # 3) an integer indicating the number of nodes in each module's bottleneck.
 pmvae = pmVAEModel(
     membership_mask,
-    [6], # This indicates that there will be one intermediate layer before the bottleneck with 6 nodes in each module. To have 2 intermediate layers of 6 nodes, you could write [6, 6]
+    [12], # This indicates that there will be one intermediate layer before the bottleneck with 12 nodes in each module. To have 2 intermediate layers of 6 nodes, you could write [6, 6]
     4, # number of nodes in each module bottleneck 
     terms=membership_mask.index, # a list of the names of the pathway modules
     add_auxiliary_module=True # whether or not to include a densely connected auxiliary module
@@ -105,7 +105,17 @@ top_features.sort_values('global_attribs',ascending=True).iloc[:30,0].plot.bar()
 ![Showing pathway attributions](/images/top_pathways_img.png)
 
 ### Identify most important genes contributing to a particular latent pathway
-This first example demonstrates how the PAUSE framework can be used to identify the most important pathways for an interpretable autoencoder.
+This first example demonstrates how the PAUSE framework can be used to identify the most important pathways for an interpretable autoencoder. However, as you see above, for the dataset in question, we can see that the most important pathways are the "uninterpretable" densely-connected auxiliary pathways. How can we identify the most important genes contributing to these latent pathways, and interpret their biological meaning? By using gene level attributions. This example uses the same trained pmVAE model as the above example. We can now take that model
+
+```python
+
+# explain tcr in terms of genes
+def model_latent_wrapper(x):
+    outs = pmvae.model(x)
+    z = outs.mu
+    return z[:,316].reshape(-1,1)
+
+```
 
 ## Reproducing experiments and figures from paper
 
