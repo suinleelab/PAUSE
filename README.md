@@ -58,6 +58,53 @@ pmvae.train(train_dataset, # a PyTorch dataset object containing the training ex
               checkpoint_path='pmvae_checkpoint.pkl' # path of model checkpoint
               )
 ```
+
+Once the model is trained, we can use the [Path Explain software](https://github.com/suinleelab/path_explain) (also provided in this repository in the `pathexplainer.py` file) to *identify the top pathways* in the dataset by explaining the trained models reconstruction error with respect to the learned latent pathways.
+
+```python
+from pathexplainer import PathExplainerTorch
+import torch
+import torch.nn.functional as F
+
+# define a wrapper function that outputs the reconstruction error of the model given the latent codes
+def model_loss_wrapper(z):
+    module_outputs = pmvae.model.decoder_net(z)
+    global_recon = pmvae.model.merge(module_outputs)
+    return F.mse_loss(global_recon, ground_truth, reduction='none').mean(1).view(-1,1)
+    
+# define a tensor to hold the original data, which gets used as an argument in the reconstruction error in the wrapper above
+ground_truth = torch.tensor(data.X).float()
+
+# get the latent codes to use as input to the model loss wrapper
+outs = pmvae.model(ground_truth)
+input_data = outs.z
+baseline_data = torch.zeros(outs.z.shape[1]) # define a baseline, in this case the zeros vector
+baseline_data.requires_grad = True
+
+# calculate the pathway attributions
+explainer = PathExplainerTorch(model_loss_wrapper)
+attributions = explainer.attributions(input_data,
+                                      baseline=baseline_data,
+                                      num_samples=200, # number of samples to use when calculating the path integral
+                                      use_expectation=False)
+
+```
+
+Once you have calculated the pathway attributions, you can average them over all samples in the dataset to identify and plot the most important pathways.
+
+```python
+# move attributions to numpy, make a df w/ index as latent space names
+np_attribs = attributions.detach().numpy()
+top_features = pd.DataFrame(index=pmvae.latent_space_names())
+top_features['global_attribs'] = np_attribs.mean(0) # in this case, global attributions are the mean over the dataset
+
+# Loss explanation
+top_features.sort_values('global_attribs',ascending=True).iloc[:30,0].plot.bar()
+```
+
+### Identify most important genes contributing to a particular latent pathway
+This first example demonstrates how the PAUSE framework can be used to identify the most important pathways for an interpretable autoencoder.
+
 ## Reproducing experiments and figures from paper
 
 For code to generate the models used, see "models.py". Pathway attributions and gene attributions are generated using code from "pathexplainer.py". Benchmarking pathways attributions against other methods for ranking pathway importance is done using the files "benchmark_pmvae.py", "benchmark_intercode.py", and "top_pathways.py". For code to generate the figures in the paper, see the folder `figures`. 
