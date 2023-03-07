@@ -103,16 +103,36 @@ top_features.sort_values('global_attribs',ascending=True).iloc[:30,0].plot.bar()
 ![Showing pathway attributions](/images/top_pathways_img.png)
 
 ### Identify most important genes contributing to a particular latent pathway
-This first example demonstrates how the PAUSE framework can be used to identify the most important pathways for an interpretable autoencoder. However, as you see above, for the dataset in question, we can see that the most important pathways are the "uninterpretable" densely-connected auxiliary pathways. How can we identify the most important genes contributing to these latent pathways, and interpret their biological meaning? By using gene level attributions. This example uses the same trained pmVAE model as the above example. We can now take that model
+This first example demonstrates how the PAUSE framework can be used to identify the most important pathways for an interpretable autoencoder. However, as you see above, these interpretable autoencoders often have multiple bottleneck nodes for each pathway, raising the question of what the difference between these bottleneck nodes is. Additionally, sometimes the most important pathways are the "uninterpretable" densely-connected auxiliary pathways. How can we identify the most important genes contributing to these latent pathways, and interpret their biological meaning? By using gene level attributions. This example uses another pmVAE model, as in the above example. This time, however, instead of getting attributions of the loss to the latent pathways, we can pick a latent pathway and explain it in terms of its input genes.
 
 ```python
+from summary import summary_plot
 
 # explain tcr in terms of genes
 def model_latent_wrapper(x):
     outs = pmvae.model(x)
     z = outs.mu
-    return z[:,316].reshape(-1,1)
+    return z[:,316].reshape(-1,1) # 316 is the latent node number corresponding to the pathway of interest here
+    
+input_data = torch.tensor(data.X).float()
+input_data.requires_grad = True
+baseline_data = torch.zeros(data.X.shape[1])
+baseline_data.requires_grad = True
 
+np_attribs = attributions.detach().numpy()
+top_features = pd.DataFrame(index=membership_mask.columns)
+top_features['global attributions'] = np.abs(np_attribs).mean(0) # to find top genes, we take the average MAGNITUDE of attribs across all samples
+
+summary_plot(np_attribs,
+             data.X,
+             feature_names=membership_mask.columns,
+             plot_top_k=10,
+             standardize_features=False,
+             scale_x_ind=False,
+             scale_y_ind=False,
+             figsize=(4, 4),
+             dpi=300,
+             cmap=coolwarm)
 ```
 
 ## Reproducing experiments and figures from paper
