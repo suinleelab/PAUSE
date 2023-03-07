@@ -1,6 +1,6 @@
 # PAUSE
 
-![Showing pathway attributions](/images/conceptFig.png)
+![Main Concept Fig](/images/conceptFig.jpg)
 
 Code for the paper "Principled feature attribution for unsupervised gene expression analysis" (PAUSE). 
 For more information, see our preprint: https://www.biorxiv.org/content/10.1101/2022.05.03.490535v1.
