@@ -102,6 +102,8 @@ top_features['global_attribs'] = np_attribs.mean(0) # in this case, global attri
 top_features.sort_values('global_attribs',ascending=True).iloc[:30,0].plot.bar()
 ```
 
+![Showing pathway attributions](/images/top_pathways_img.png)
+
 ### Identify most important genes contributing to a particular latent pathway
 This first example demonstrates how the PAUSE framework can be used to identify the most important pathways for an interpretable autoencoder.
 
