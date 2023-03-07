@@ -119,9 +119,15 @@ input_data.requires_grad = True
 baseline_data = torch.zeros(data.X.shape[1])
 baseline_data.requires_grad = True
 
+explainer = PathExplainerTorch(model_latent_wrapper) # this time, use explanation software with latent output wrapper
+attributions = explainer.attributions(input_data,
+                                      baseline=baseline_data,
+                                      num_samples=200, # again use 200 interpolation points to numerically approximate the path integral
+                                      use_expectation=False)
+
 np_attribs = attributions.detach().numpy()
 top_features = pd.DataFrame(index=membership_mask.columns)
-top_features['global attributions'] = np.abs(np_attribs).mean(0) # to find top genes, we take the average MAGNITUDE of attribs across all samples
+top_features['global_attribs'] = np.abs(np_attribs).mean(0) # to find top genes, we take the average MAGNITUDE of attribs across all samples
 
 summary_plot(np_attribs,
              data.X,
@@ -134,6 +140,8 @@ summary_plot(np_attribs,
              dpi=300,
              cmap=coolwarm)
 ```
+
+![Showing genee attributions](/images/top_genes_tcr.png)
 
 ## Reproducing experiments and figures from paper
 
